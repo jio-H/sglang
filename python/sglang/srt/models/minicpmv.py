@@ -22,6 +22,7 @@
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
 
 from functools import partial
+import types
 from typing import (
     Any,
     Callable,
@@ -55,6 +56,7 @@ from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from sglang.srt.models.llama import LlamaConfig, LlamaForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list
 
@@ -821,8 +823,7 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        assert self.version == (4, 0)
-
+        assert self.version == (4, 0) or self.version == (4, 5) 
     # TODO:要修改的应该只有这个LLM模型
     def init_llm(
         self,
@@ -933,8 +934,35 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
 
+class MiniCPMV4_5(MiniCPMV4_0):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        assert self.version == (4, 5)
+
+    def init_llm(
+            self,
+            config: Qwen3Config,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
+        ) -> nn.Module:
+            llm = Qwen3ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
+            # 函数补丁，qwen3没有实现对应函数
+            llm.get_input_embeddings = types.MethodType(
+                lambda self: self.model.get_input_embeddings(),
+                llm
+            )
+            return llm
+    
+
+   
 # TODO：修改版本号
-_SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0}
+_SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0, (4, 5): MiniCPMV4_5}
 
 
 class MiniCPMV:
@@ -961,18 +989,15 @@ class MiniCPMV:
     ) -> None:
         super().__init__()
 
-        # 默认版本号或者输出版本号
-        # TODO：添加v4版本号判断
         if not hasattr(config, "version"):
             version = (2, 6)
         else:
             version = str(config.version).split(".")
             version = tuple([int(x) for x in version])
-        # Dispatch class based on version
-        # 判断版本号是否支持
+
         instance_class = _SUPPORT_VERSION.get(version)
         if instance_class is None:
-            raise ValueError("Currently, MiniCPMV only supports versions 2.6")
+            raise ValueError("Currently, MiniCPMV only supports versions 2.6, 4.0 and 4.5")
 
         try:
             minicpmv = instance_class(

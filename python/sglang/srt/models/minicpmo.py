@@ -37,6 +37,7 @@ from transformers.models.whisper.modeling_whisper import (
     WhisperEncoder,
 )
 
+from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -103,6 +104,26 @@ def apply_spk_emb(
 
     return
 
+def gen_logits(
+    num_code: int,
+    top_P=0.7,
+    top_K=50,
+    repetition_penalty=1.1):
+    logits_warpers = []
+    # if top_P is not None:
+        # logits_warpers.append(TopPLogitsWarper(top_P, min_tokens_to_keep=3))
+    # if top_K is not None:
+        # logits_warpers.append(TopKLogitsWarper(top_K, min_tokens_to_keep=3))
+
+    logits_processors = []
+    if repetition_penalty is not None and repetition_penalty != 1:
+        logits_processors.append(
+            CustomRepetitionPenaltyLogitsProcessorRepeat(
+                repetition_penalty, num_code, 16
+            )
+        )
+
+    return None, logits_processors
 
 @dataclass
 class ConditionalChatTTSGenerationOutput(ModelOutput):
@@ -122,6 +143,24 @@ class ConditionalChatTTSGenerationOutput(ModelOutput):
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     finished: bool = None
 
+@dataclass
+class MiniCPMTTSGenerationOutput(ModelOutput):
+    """
+    Output class for MiniCPMTTS generation.
+
+    Args:
+        new_ids (torch.LongTensor): Newly generated audio code sequence, shape (batch_size, sequence_length, num_vq).
+        audio_input_ids (torch.LongTensor): Updated input IDs including condition and generated audio codes, shape (batch_size, full_sequence_length, num_vq).
+        past_key_values (Tuple[Tuple[torch.FloatTensor]]): Tuple containing pre-computed keys and values used for attention mechanism. Each element has shape (batch_size, num_heads, sequence_length, embed_size_per_head).
+        finished (bool): Boolean indicating whether generation is complete.
+
+    """
+
+    new_ids: torch.LongTensor = None
+    audio_input_ids: torch.LongTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    past_input_ids: Optional[torch.LongTensor] = None
+    finished: bool = None
 
 def make_streaming_chunk_mask_generation(
     inputs_embeds: torch.Tensor,
@@ -1084,7 +1123,715 @@ class ConditionalChatTTS(PreTrainedModel):
         del batch_result
         return mel_specs
 
+class MiniCPMMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.in_dim = config.llm_hidden_size
+        self.out_dim = config.hidden_size
+        self.intermediate_size = config.llm_intermediate_size
+        self.gate_proj = nn.Linear(self.in_dim, self.intermediate_size, bias=True)
+        self.up_proj = nn.Linear(self.in_dim, self.intermediate_size, bias=True)
+        self.down_proj = nn.Linear(self.intermediate_size, self.out_dim, bias=True)
+        self.act_fn = ACT2FN[config.hidden_act]
+ 
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
+        return down_proj
+    
+class MiniCPMTTS(PreTrainedModel):
+    config_class = PretrainedConfig
+
+    def __init__(
+            self,
+            config: PretrainedConfig,
+            audio_tokenizer: None):
+        super().__init__(config)
+
+        self.use_speaker_embedding = config.use_speaker_embedding
+        self.use_llm_hidden_state = config.use_llm_hidden_state
+        self.num_spk_embs = config.num_spk_embs
+        self.spk_emb_token_id = config.spk_emb_token_id
+
+        self.use_text = config.use_text
+        self.streaming = config.streaming
+        self.streaming_text_chunk_min = config.streaming_text_chunk_min
+        self.streaming_text_chunk_max = config.streaming_text_chunk_max
+        self.streaming_audio_chunk_size = config.streaming_audio_chunk_size
+        self.streaming_text_reserved_len = config.streaming_text_reserved_len
+        # streaming tts
+        self.streaming_text_chunk_size = config.streaming_text_chunk_max
+        self.audio_bos_token_id = config.audio_bos_token_id
+        self.num_mel_bins = config.num_mel_bins
+        self.num_vq = config.num_vq
+        self.num_audio_tokens = config.num_audio_tokens
+
+        self.top_p = config.top_p
+        self.top_k = config.top_k
+        self.repetition_penalty = config.repetition_penalty
+        
+        self.interleaved = config.interleaved
+        self.attention_type = config.attention_type
+        self.recomputed_chunks = config.recomputed_chunks
+        self.window_size = config.window_size
+        if self.attention_type == "sliding_recompute" and self.window_size <= self.recomputed_chunks:
+            raise ValueError(
+                f"Sliding recompute requires window_size > recomputed_chunks, but got window_size={self.window_size} and recomputed_chunks={self.recomputed_chunks}"
+            )
+
+        if config.backbone_model == "llama":
+            print(f"initializating tts model, using {config.attn_implementation} implementation")
+            model_config = LlamaConfig(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                num_attention_heads=config.num_attention_heads,
+                num_hidden_layers=config.num_hidden_layers,
+                max_position_embeddings=config.max_position_embeddings,
+                attn_implementation=config.attn_implementation,
+            )
+            
+            self.emb_text = nn.Embedding(
+                config.num_text_tokens, config.hidden_size
+            )
+
+            model = LlamaModel(model_config)
+            self.model = model
+        
+        else:
+            raise ValueError(f"Unsupported backbone model: {config.backbone_model}")
+        
+        self.projector_spk = self.create_projector(config)
+        self.projector_semantic = self.create_projector(config)
+
+        self.audio_tokenizer = audio_tokenizer
+
+        self.emb_code = nn.ModuleList(
+            [
+                nn.Embedding(config.num_audio_tokens, config.hidden_size) for _ in range(config.num_vq)
+            ]
+        )
+        
+        self.head_code = nn.ModuleList(
+            [
+                parametrizations.weight_norm(
+                    nn.Linear(config.hidden_size, config.num_audio_tokens, bias=False),
+                    name="weight",
+                ) for _ in range(config.num_vq)
+            ]
+        )
+
+        self.condition_type = config.condition_type
+
+        return
+
+    def create_projector(self, config):
+        if config.projector_type == "mlp":
+            print("Using MLP projector")
+            return MultiModalProjector(config.llm_dim, config.hidden_size)
+        elif config.projector_type == "minicpm":
+            print(f"Using MiniCPMMLP projector with activation: {config.hidden_act}")
+            return MiniCPMMLP(config)
+        # elif config.projector_type == "gemma":
+        #     print(f"Using GemmaMLP projector")
+        #     return GemmaMLP(config)
+        elif config.projector_type == "default":
+            print("Using linear projector")
+            return nn.Linear(config.llm_dim, config.hidden_size, bias=False)
+        else:
+            raise ValueError(f"Unsupported projector type: {config.projector_type}") 
+    
+    """
+    非流式API，一次性生成整体的audio序列
+    """
+    @torch.inference_mode()
+    def generate(
+        self, 
+        inputs_embeds: torch.Tensor, 
+        eos_token: Union[int, torch.Tensor], 
+        temperature: float=0.8, 
+        force_no_stop=False,
+        repetition_penalty: float=1.05,
+        min_new_token=50, 
+        max_new_token=2048,
+        show_tqdm=True, 
+        streaming=False,
+        text_lengths=None):
+        print(f"generate with repetition_penalty={repetition_penalty}, temperature={temperature}")
+        # self.model.eval()
+        # logits_warpers, logits_processors = gen_logits(
+        #     num_code=4097, top_P=0.9, 
+        # ) # , top_K=20 repetition_penalty=1.0
+
+        temperature = torch.tensor([temperature], dtype=torch.float, device=self.device)
+
+        logits_warpers, logits_processors = gen_logits(
+            num_code=self.config.num_audio_tokens, repetition_penalty=repetition_penalty
+        )
+        
+        # We only support batch size `1` for now
+        assert inputs_embeds.shape[0] == 1
+        eos_token = eos_token.to(inputs_embeds.device)
+        finish = torch.zeros(inputs_embeds.shape[0], device=inputs_embeds.device).bool()
+
+        temperature = (
+            temperature.unsqueeze(0)
+            .expand(inputs_embeds.shape[0], -1)
+            .contiguous()
+            .view(-1, 1)
+        ).to(inputs_embeds.device)
+
+        condition_length = inputs_embeds.shape[1]
+        pbar: Optional[tqdm] = None
+        if show_tqdm:
+            pbar = tqdm(
+                total=max_new_token,
+                desc="code",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}(max) [{elapsed}, {rate_fmt}{postfix}]",
+            )
+
+        # 预先构造整个streaming mask 4d，每个元素可以任意slice，能确保正确
+        if streaming:
+            assert text_lengths is not None
+            tts_attention_mask_4d = make_streaming_sliding_window_causal_mask_4d(
+                batch_size = 1,
+                text_lengths = text_lengths, # 实际有效的文本长度（不被causal mask掉）
+                audio_lengths = [max_new_token], # 可以让模型生成最长audio token数
+                max_text_length = self.config.streaming_sliding_window_max_text_len, # max_text_length
+                average_speed = self.config.streaming_sliding_window_average_speed, # 5 token /s 
+                fast_speed = self.config.streaming_sliding_window_fast_speed,
+                slow_speed = self.config.streaming_sliding_window_slow_speed,
+                audio_frame_rate = self.config.streaming_sliding_window_audio_frame_rate,
+                text_window_size = self.config.streaming_sliding_window_text_window_size,
+                audio_init_text_length = self.config.streaming_sliding_window_audio_init_text_length,
+                audio_window_size = self.config.streaming_sliding_window_audio_window_size, 	# audio sliding window
+                # audio_window_size = 100, # for debug only
+                dtype = self.dtype
+            ).to('cuda')
+
+        new_tokens = torch.zeros(inputs_embeds.shape[0], max_new_token, self.num_vq, device=inputs_embeds.device, dtype=torch.long)
+        
+        past_key_values = None
+
+        # from IPython import embed
+        # embed()
+        
+        for t in range(max_new_token):
+            # print("generating {}-th token".format(t))
+            # Prepare generation inputs
+            audio_bos = False
+            # If this is the first audio token, the case is special
+            if t == 0:
+                audio_bos = True
+                inputs_embeds = inputs_embeds
+                position_ids = torch.tensor(
+                    list(range(0, condition_length)),
+                    dtype=torch.long,
+                    device=self.device
+                ).unsqueeze(0)
+                # cache_position = position_ids.clone()
+
+                if streaming:
+                    causal_mask_4d = tts_attention_mask_4d[:, :, 0:condition_length, 0:condition_length] # [1, 1, condition_length, condition_length]
+                
+                    print(f"t={t}, causal_mask_4d.shape={causal_mask_4d.shape}")
+                    assert causal_mask_4d.shape[3] == inputs_embeds.shape[1]
+                    
+                else:
+                    causal_mask_4d = None
+                
+            else:
+                # Generate the following audio tokens, it is applicable to all other cases, including second and the following calling of `generate`
+                
+                # print("new_tokens[:, t-1:t, q]", new_tokens[:, t-1:t, :])
+                
+                code_emb = []
+                for q in range(self.num_vq):
+                    x = self.emb_code[q](new_tokens[:, t-1:t, q]) # 编码上次生成的4个code
+                    # print("q,code", new_tokens[:, t-1:t, q].shape)
+                    # print("q,x", q, x.shape)
+                    code_emb.append(x)
+
+                inputs_embeds = torch.stack(code_emb, 3).sum(3)
+                
+                
+                position_ids = torch.tensor(
+                    [condition_length + t - 1], # 把上一个token prefill进去 501.0(502.1)
+                    dtype=torch.long,
+                    device=self.device
+                ).unsqueeze(0)
+
+                if streaming:
+                    causal_mask_4d = tts_attention_mask_4d[:, :, condition_length+t-1:condition_length+t, 0:condition_length+t] # [1, 1, 1=501.0(502.1), condition_length+t=501+1] 以t=1时为例，可以思考一下
+                    
+                    if t < 2:
+                        print(f"t={t}, before forward sliced causal_mask_4d", causal_mask_4d.shape)
+                        print(f"t={t}, before forward past_key_values[0][0].shape", past_key_values[0][0].shape)
+                    assert causal_mask_4d.shape[3] == past_key_values[0][0].shape[2] + 1 # all past positions + 1 new position for this forward pass
+                    
+                else:
+                    causal_mask_4d = None
+            
+                # cache_position = position_ids.clone()
+            
+            # print("inputs_embeds", inputs_embeds.shape)
+            
+            # Model forward
+            if self.config.backbone_model == "llama":
+                outputs: BaseModelOutputWithPast = self.model(
+                    position_ids=position_ids,
+                    cache_position=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=causal_mask_4d,
+                    use_cache=True,
+                    output_attentions=False,
+                    # return_dict=True,  # Add this to ensure returns dict with past_key_values
+                )
+            elif self.config.backbone_model == "qwen":
+                outputs = self.model.model(
+                    inputs_embeds=inputs_embeds,
+                    position_ids=position_ids,
+                    cache_position=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_attentions=False,
+                    attention_mask=causal_mask_4d,
+                    # return_dict=True,
+                )
+            else:
+                raise ValueError(f"Unsupported backbone model: {self.config.backbone_model}")
+                
+            del position_ids
+            del inputs_embeds
+            
+            hidden_states = outputs.last_hidden_state
+            past_key_values = outputs.past_key_values
+            # print("past_key_values 0,0", past_key_values[0][0].shape)
+            # print("hidden_states", hidden_states.shape)
+            
+            with P.cached():
+                logits = torch.empty(
+                    hidden_states.size(0),
+                    hidden_states.size(1),
+                    self.num_audio_tokens,
+                    self.num_vq,
+                    dtype=torch.float,
+                    device=self.device,
+                )
+                for num_vq_iter in range(self.num_vq):
+                    x: torch.Tensor = self.head_code[num_vq_iter](hidden_states)
+                    logits[..., num_vq_iter] = x
+                    del x
+
+            del hidden_states
+
+            logits = logits[:, -1].float()
+            # logits = logits.narrow(1, -1, 1).squeeze_(1).float()
+
+            # logits = rearrange(logits, "b c n -> (b n) c")
+            logits = logits.permute(0, 2, 1)
+            logits = logits.reshape(-1, logits.size(2))
+            # logits_token = rearrange(input_ids[:, start_idx:], "b c n -> (b n) c")
+            
+            logits /= temperature
+            
+            if not audio_bos:
+                input_ids_sliced = new_tokens[:, 0: t].permute(0, 2, 1) # get previous t new tokens 
+                # print("input_ids_sliced", input_ids_sliced.shape)
+                
+                logits_token = input_ids_sliced.reshape(
+                    input_ids_sliced.size(0) * input_ids_sliced.size(1),
+                    -1,
+                ).to(self.device)
+                
+                del input_ids_sliced
+                
+                for logitsProcessors in logits_processors:
+                    logits = logitsProcessors(logits_token, logits)
+                
+                # for logitsWarpers in logits_warpers:
+                #     logits = logitsWarpers(logits_token, logits)
+
+                del logits_token
+
+            if t < min_new_token:
+                logits[:, eos_token] = -torch.inf
+            
+            if force_no_stop:
+                logits[:, eos_token] = -torch.inf
+            
+            scores = F.softmax(logits, dim=-1)
+
+            del logits
+
+            # print(scores)
+
+            idx_next = torch.multinomial(scores, num_samples=1).to(finish.device)
+
+            del scores
+
+            # idx_next = rearrange(idx_next, "(b n) 1 -> b n", n=self.num_vq)
+            idx_next = idx_next.view(-1, self.num_vq)
+            
+            # print("idx_next", idx_next)
+            
+            finish_or = idx_next.eq(eos_token).any(1)
+            finish.logical_or_(finish_or)
+            
+            del finish_or
+            # 新的 `token` 存入 `input_ids_buf`
+            new_tokens[:, t] = idx_next
+
+            if t == 0 and finish.any():
+                # raise Exception
+                break
+
+            del idx_next
+
+            if finish.all():
+                break
+
+            if pbar is not None:
+                pbar.update(1)
+
+        if pbar is not None:
+            pbar.close()
+
+        if not finish.all():
+            print(
+                f"incomplete result. hit max_new_token: {max_new_token}"
+            )
+
+        # if finish.all():
+        #     # the last may contains eos token
+        #     genrated_input_ids = new_tokens[0:t]
+        # else:
+        #     # there is no eos token
+        genrated_input_ids = new_tokens[:, 0:t, :]
+        
+        # print("* genrated_input_ids mock", genrated_input_ids)
+        # print("* past_key_values mock: audio-A", past_key_values[0][0][0, 0, self.config.streaming_sliding_window_max_text_len: self.config.streaming_sliding_window_max_text_len+10, 0])
+        # print("* past_key_values mock: audio-B", past_key_values[0][1][0, 0, self.config.streaming_sliding_window_max_text_len: self.config.streaming_sliding_window_max_text_len+10, 0])
+        # print("* past_key_values mock: audio-C", past_key_values[1][0][0, 0, self.config.streaming_sliding_window_max_text_len: self.config.streaming_sliding_window_max_text_len+10, 0])
+        # print("* past_key_values mock: text", past_key_values[0][0][0, 0, 0: 10, 0])
+        
+        return MiniCPMTTSGenerationOutput(
+            new_ids=genrated_input_ids, 
+            audio_input_ids=None, # for update purpose
+            past_key_values=None, # for update purpose
+            past_input_ids=None, # for update purpose
+            finished=finish.all(),
+        )
+
+    """
+    非流式API，采用interleave的范式生成整体的audio序列
+    """
+    @torch.inference_mode()
+    def generate_chunk(
+        self, 
+        inputs_embeds: torch.Tensor, 
+        temperature: torch.Tensor, 
+        repetition_penalty: float,
+        eos_token: Union[int, torch.Tensor], 
+        force_no_stop=False,
+        max_new_token=500,
+        past_key_values = None,
+        logits_processors = None,
+        text_start_pos = None):
+        
+        """
+        For inputs_embeds, it should be like [bs=1, seq_len, hidden_dim], its content is like:
+        |Text BOS|Spk embeds|Text-Hidden states Interleave (if applicable)|Audio BOS|
+        where the last position is the audio BOS token.
+        So, the first iteration in generation directly forward the model with inputs_embeds, and the last hidden states of the last position (Audio BOS) will be decoded to get the first audio token.
+        """
+        # self.model.eval()
+        logits_warpers, logits_processors = gen_logits(
+            num_code=self.config.num_audio_tokens, repetition_penalty=repetition_penalty
+        ) # , top_K=20 repetition_penalty=1.0 top_P=0.9, 
+        
+        # We only support batch size `1` for now
+        assert inputs_embeds.shape[0] == 1
+        eos_token = eos_token.to(inputs_embeds.device)
+        finish = torch.zeros(inputs_embeds.shape[0], device=inputs_embeds.device).bool()
+        
+        temperature = (
+            temperature.unsqueeze(0)
+            .expand(inputs_embeds.shape[0], -1)
+            .contiguous()
+            .view(-1, 1)
+        ).to(inputs_embeds.device)
+
+        condition_length = inputs_embeds.shape[1]
+        
+        new_tokens = torch.zeros(inputs_embeds.shape[0], max_new_token, self.num_vq, device=inputs_embeds.device, dtype=torch.long)
+        
+        for t in range(max_new_token):
+            # print("generating {}-th token".format(t))
+            # Prepare generation inputs
+            
+            audio_bos = False
+            
+            # If this is the first audio token, the case is special
+            if t == 0:
+                audio_bos = True
+                inputs_embeds_ = inputs_embeds
+                position_ids = torch.tensor(
+                    list(range(text_start_pos, text_start_pos + condition_length)),
+                    dtype=torch.long,
+                    device=self.device
+                ).unsqueeze(0)
+                
+                # cache_position = position_ids.clone()
+
+            else:
+                # Generate the following audio tokens, it is applicable to all other cases, including second and the following calling of `generate`
+                
+                # print("new_tokens[:, t-1:t, q]", new_tokens[:, t-1:t, :])
+                # Simplified version for num_vq=1
+                inputs_embeds_ = self.emb_code[0](new_tokens[:, t-1:t, 0])
+                
+                position_ids = torch.tensor(
+                    [text_start_pos + condition_length + t - 1], # 把上一个token prefill进去
+                    dtype=torch.long,
+                    device=self.device
+                ).unsqueeze(0)
+            
+                # cache_position = position_ids.clone()
+            
+            outputs: BaseModelOutputWithPast = self.model(
+                position_ids=position_ids,
+                # cache_position=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds_,
+                use_cache=True,
+                output_attentions=False,
+                # return_dict=True,  # Add this to ensure returns dict with past_key_values
+            )
+            
+            # outputs = self.model.model(
+            #     inputs_embeds=inputs_embeds_,
+            #     position_ids=position_ids,
+            #     cache_position=position_ids,
+            #     past_key_values=past_key_values,
+            #     use_cache=True,
+            #     output_attentions=False,
+            #     # return_dict=True,
+            # )
+            
+            del position_ids
+            del inputs_embeds_
+            
+            # if streaming_mask_v1 is not None:
+            #     print(f"t={t}, outputs.past_key_values[0][0].shape={outputs.past_key_values[0][0].shape}")
+            
+            hidden_states = outputs.last_hidden_state
+            past_key_values = outputs.past_key_values
+            
+            # print("past_key_values 0,0", past_key_values[0][0].shape)
+            # print("hidden_states", hidden_states.shape)
+            
+            with P.cached():
+                logits = torch.empty(
+                    hidden_states.size(0),
+                    hidden_states.size(1),
+                    self.num_audio_tokens,
+                    self.num_vq,
+                    dtype=torch.float,
+                    device=self.device,
+                )
+                for num_vq_iter in range(self.num_vq):
+                    x: torch.Tensor = self.head_code[num_vq_iter](hidden_states)
+                    logits[..., num_vq_iter] = x
+                    del x
+
+            del hidden_states
+
+            logits = logits[:, -1].float()
+            # logits = logits.narrow(1, -1, 1).squeeze_(1).float()
+
+            # logits = rearrange(logits, "b c n -> (b n) c")
+            logits = logits.permute(0, 2, 1)
+            logits = logits.reshape(-1, logits.size(2))
+            # logits_token = rearrange(input_ids[:, start_idx:], "b c n -> (b n) c")
+            
+            logits /= temperature
+            
+            if not audio_bos:
+                input_ids_sliced = new_tokens[:, 0: t].permute(0, 2, 1) # get previous t new tokens 
+                # print("input_ids_sliced", input_ids_sliced.shape)
+                
+                logits_token = input_ids_sliced.reshape(
+                    input_ids_sliced.size(0) * input_ids_sliced.size(1),
+                    -1,
+                ).to(self.device)
+                
+                del input_ids_sliced
+                
+                for logitsProcessors in logits_processors:
+                    logits = logitsProcessors(logits_token, logits)
+                
+                # for logitsWarpers in logits_warpers:
+                #     logits = logitsWarpers(logits_token, logits)
+
+                del logits_token
+            
+            if force_no_stop:
+                logits[:, eos_token] = -torch.inf
+            
+            scores = F.softmax(logits, dim=-1)
+
+            del logits
+
+            idx_next = torch.multinomial(scores, num_samples=1).to(finish.device)
+
+            del scores
+
+            # idx_next = rearrange(idx_next, "(b n) 1 -> b n", n=self.num_vq)
+            idx_next = idx_next.view(-1, self.num_vq)
+            
+            # print("idx_next", idx_next)
+            
+            finish_or = idx_next.eq(eos_token).any(1)
+            finish.logical_or_(finish_or)
+            
+            del finish_or
+            # 新的 `token` 存入 `input_ids_buf`
+            new_tokens[:, t] = idx_next
+
+            if t == 0 and finish.any():
+                # raise Exception
+                break
+
+            del idx_next
+
+            if finish.all():
+                break
+
+        if not finish.all():
+            print(
+                f"incomplete result. hit max_new_token: {max_new_token}"
+            )
+
+        # if finish.all():
+        #     # the last may contains eos token
+        #     genrated_input_ids = new_tokens[0:t]
+        # else:
+        #     # there is no eos token
+        genrated_input_ids = new_tokens[:, 0:t, :]
+        
+        # print("genrated_input_ids inner", genrated_input_ids.shape)
+        return genrated_input_ids, past_key_values
+    
+    @torch.inference_mode()
+    def interleaved_generate(
+        self, 
+        spk_embeds: torch.Tensor,
+        conditions: List[torch.Tensor], 
+        temperature: torch.Tensor, 
+        repetition_penalty: float,
+        eos_token: Union[int, torch.Tensor], 
+        **kwargs):
+        """
+        For inputs_embeds, it should be like [bs=1, seq_len, hidden_dim], its content is like:
+        |Text BOS|Spk embeds|Text-Hidden states Interleave (if applicable)|Audio BOS|
+        where the last position is the audio BOS token.
+        So, the first iteration in generation directly forward the model with inputs_embeds, and the last hidden states of the last position (Audio BOS) will be decoded to get the first audio token.
+        """
+        spk_embeds = spk_embeds.unsqueeze(0)
+        temperature = torch.tensor([temperature], dtype=torch.float, device=self.device)
+        # self.model.eval()
+        logits_warpers, logits_processors = gen_logits(
+            num_code=self.config.num_audio_tokens, repetition_penalty=repetition_penalty,
+        )
+        # , top_K=20 repetition_penalty=1.0 top_P=0.9,
+
+        eos_token = eos_token.to(conditions[0].device)
+        
+        num_chunks = len(conditions)
+        text_start_pos = 0
+        last_window_size = 0
+        past_key_values = None
+        
+        for idx in range(num_chunks):
+            condition = conditions[idx].to(conditions[0].device)
+            if idx == 0:
+                condition = torch.cat([spk_embeds, condition], dim=1)
+                
+            if self.attention_type == "sliding_recompute":
+                recomputed_conditions = [spk_embeds]
+                
+                if idx >= self.window_size and (idx - self.recomputed_chunks) % (self.window_size - self.recomputed_chunks) == 0:
+                    for i in range(self.recomputed_chunks):
+                        recomputed_conditions.append(conditions[idx-self.recomputed_chunks+i])
+                        recomputed_conditions.append(self.emb_code[0](generated_tokens[-self.recomputed_chunks+i][:,:,0]))
+                    recomputed_conditions.append(condition)
+                    condition = torch.cat(recomputed_conditions, dim=1)
+                    
+                    text_start_pos = 0
+                    new_tokens, old_kv = self.generate_chunk(
+                        inputs_embeds=condition,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                        eos_token=eos_token,
+                        force_no_stop=False,
+                        max_new_token=500,
+                        past_key_values=None,
+                        logits_processors=logits_processors,
+                        text_start_pos=text_start_pos,
+                    )
+    
+                else:                  
+                    new_tokens, old_kv = self.generate_chunk(
+                        inputs_embeds=condition,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                        eos_token=eos_token,
+                        force_no_stop=False,
+                        max_new_token=500,
+                        past_key_values=past_key_values,
+                        logits_processors=logits_processors,
+                        text_start_pos=text_start_pos,
+                    )
+
+            else:                             
+                new_tokens, old_kv = self.generate_chunk(
+                    inputs_embeds=condition,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    eos_token=eos_token,
+                    force_no_stop=False,
+                    max_new_token=500,
+                    past_key_values=past_key_values,
+                    logits_processors=logits_processors,
+                    text_start_pos=text_start_pos,
+                )
+            
+            past_key_values = []
+            if self.attention_type == "sliding_window" and idx >=1:
+                for layer_idx in range(len(old_kv)):
+                    past_key_values.append((
+                        old_kv[layer_idx][0][:, :, last_window_size:, :],
+                        old_kv[layer_idx][1][:, :, last_window_size:, :],
+                    ))
+            else:
+                past_key_values = old_kv
+                
+            last_window_size = condition.shape[1] + new_tokens.shape[1]
+            text_start_pos += last_window_size
+            
+            if idx == 0:
+                generated_tokens = [new_tokens]
+            else:
+                # generated_tokens = torch.cat([generated_tokens, new_tokens], dim=1)
+                generated_tokens.append(new_tokens)
+        
+        return MiniCPMTTSGenerationOutput(
+            new_ids=torch.cat(generated_tokens, dim=1),
+            finished=True,
+        )
+  
 # Copied from transformers.models.whisper.modeling_whisper.WhisperEncoderLayer and add use_cache for streaming inference
 class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
@@ -1410,7 +2157,7 @@ class MultiModalProjector(nn.Module):
         return hidden_states
 
 
-class MiniCPMO(MiniCPMBaseModel):
+class MiniCPMO2_6(MiniCPMBaseModel):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1832,6 +2579,442 @@ class MiniCPMO(MiniCPMBaseModel):
         )
         return hidden_states
 
+class MiniCPMO4_0(MiniCPMO2_6):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__(config=config, quant_config=quant_config)
+
+    def init_tts_module(self):
+        model = MiniCPMTTS(self.config.tts_config, audio_tokenizer=None)
+        return model
+
+    def init_audio_module(self):
+        model = MiniCPMWhisperEncoder(self.config.audio_config)
+        return model
+
+    def init_llm(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        return LlamaForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
+
+    def init_vision_module(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str = "",
+    ):
+        if self.config._attn_implementation == "flash_attention_2":
+            self.config.vision_config._attn_implementation = "flash_attention_2"
+        else:
+            self.config.vision_config._attn_implementation = "eager"
+        model = Idefics2VisionTransformer(
+            config=config.vision_config, quant_config=quant_config, prefix=prefix
+        )
+        if self.config.drop_vision_last_layer:
+            model.encoder.layers = model.encoder.layers[:-1]
+
+        setattr(model, "embed_dim", model.embeddings.embed_dim)
+        setattr(model, "patch_size", model.embeddings.patch_size)
+
+        return model
+
+    def init_resampler(
+        self,
+        embed_dim: int,
+        vision_dim: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        with set_default_torch_dtype(torch.float16):
+            # The resampler in 2.6 remains consistent with the one in 2.5.
+            resampler = Resampler2_5(
+                num_queries=self.config.query_num,
+                embed_dim=embed_dim,
+                num_heads=embed_dim // 128,
+                kv_dim=vision_dim,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+
+        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+
+    def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
+        # Get all special token IDs
+        im_start_id: int = mm_input.im_start_id
+        im_end_id: int = mm_input.im_end_id
+        slice_start_id: int = mm_input.slice_start_id
+        slice_end_id: int = mm_input.slice_end_id
+
+        data_token_pairs = [
+            (im_start_id, im_end_id),
+            (slice_start_id, slice_end_id),
+            (mm_input.audio_start_id, mm_input.audio_end_id),
+        ]
+        data_start_token_ids = [im_start_id, mm_input.audio_start_id]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
+        )
+
+        return pattern.pad_input_tokens(input_ids, mm_input)
+
+    def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
+        """
+        Computes the output length of the convolutional layers and the output length of the audio encoder
+        """
+        input_lengths_after_cnn = (input_lengths - 1) // 2 + 1
+        input_lengths_after_pooling = (
+            input_lengths_after_cnn - self.config.audio_pool_step
+        ) // self.config.audio_pool_step + 1
+        input_lengths_after_pooling = input_lengths_after_pooling.to(dtype=torch.int32)
+
+        return input_lengths_after_cnn, input_lengths_after_pooling
+
+    def get_audio_embedding_streaming(self, items: List[MultimodalDataItem]):
+        r"""
+        Extract audio embeddings in a streaming manner using cached key-value pairs.
+
+        This method processes incoming audio features incrementally and stores/updates `past_key_values`
+        for faster inference on subsequent audio frames. It only supports batch_size=1 and is intended
+        for streaming scenarios.
+
+        Returns:
+            List[List[torch.Tensor]]: audio embeddings
+        """
+        wavforms = flatten_nested_list(
+            [item.audio_features for item in items if item.audio_features]
+        )
+        # list, [[x1, x2], [y1], [z1]]
+        audio_feature_lens_raw = flatten_nested_list(
+            [item.audio_feature_lens for item in items if item.audio_feature_lens]
+        )
+
+        # exist audio
+        if len(wavforms) > 0:
+            audio_feature_lens = torch.hstack(audio_feature_lens_raw)
+            batch_size, _, max_mel_seq_len = wavforms.shape
+            assert batch_size == 1
+            max_seq_len = (max_mel_seq_len - 1) // 2 + 1
+
+            if self.audio_past_key_values is not None:
+                cache_length = self.audio_past_key_values[0][0].shape[2]
+                apm_max_len = self.apm.embed_positions.weight.shape[0]
+                if cache_length + max_seq_len >= apm_max_len:
+                    logger.warning(
+                        f"audio_past_key_values length {cache_length + max_seq_len} exceed {apm_max_len}, reset."
+                    )
+                    self.audio_past_key_values = None
+
+            audio_outputs = self.apm(
+                wavforms, past_key_values=self.audio_past_key_values, use_cache=True
+            )
+            audio_states = (
+                audio_outputs.last_hidden_state
+            )  # [:, :audio_feat_lengths, :]
+            self.audio_past_key_values = audio_outputs.past_key_values
+
+            audio_embeds = self.audio_projection_layer(audio_states)
+
+            audio_embeds = audio_embeds.transpose(1, 2)
+            audio_embeds = self.audio_avg_pooler(audio_embeds)
+            audio_embeds = audio_embeds.transpose(1, 2)
+
+            _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(
+                audio_feature_lens
+            )
+
+            num_audio_tokens = feature_lens_after_pooling
+
+            final_audio_embeds = []
+            idx = 0
+            for i in range(len(audio_feature_lens_raw)):
+                target_audio_embeds = []
+                for _ in range(len(audio_feature_lens_raw[i])):
+                    target_audio_embeds.append(
+                        audio_embeds[idx, : num_audio_tokens[idx], :]
+                    )
+                    idx += 1
+                final_audio_embeds.append(target_audio_embeds)
+            return final_audio_embeds
+        else:
+            return []
+
+    def subsequent_chunk_mask(
+        self,
+        size: int,
+        chunk_size: int,
+        num_left_chunks: int = -1,
+        device: torch.device = torch.device("cpu"),
+        num_lookhead: int = 0,
+    ) -> torch.Tensor:
+        """Create mask for subsequent steps (size, size) with chunk size,
+        this is for streaming encoder
+
+        Args:
+            size (int): size of mask
+            chunk_size (int): size of chunk
+            num_left_chunks (int): number of left chunks
+                <0: use full chunk
+                >=0: use num_left_chunks
+            device (torch.device): "cpu" or "cuda" or torch.Tensor.device
+
+        Returns:
+            torch.Tensor: mask
+
+        """
+        ret = torch.zeros(size, size, device=device, dtype=torch.bool)
+        for i in range(size):
+            if num_left_chunks < 0:
+                start = 0
+            else:
+                start = max((i // chunk_size - num_left_chunks) * chunk_size, 0)
+            ending = min((i // chunk_size + 1) * chunk_size + num_lookhead, size)
+            ret[i, start:ending] = True
+        return ret
+
+    def get_audio_embedding(self, items: List[MultimodalDataItem], chunk_length=-1):
+        r"""
+        Extract full audio embeddings with optional chunk-based attention.
+
+        This method computes embeddings for all audio frames at once, either using full attention (when
+        `chunk_length` is -1) or chunk-based attention (when `chunk_length` is a positive number). It does
+        not use key-value caching and is suitable for non-streaming inference.
+
+        Args:
+            chunk_length (int, optional): Determines whether to use full attention (-1) or chunk-based
+                attention (>0) during embedding computation.
+
+        Returns:
+            List[List[torch.Tensor]]: audio embeddings
+        """
+        # (bs, 80, frames) or [], multi audios need filled in advance
+        wavforms = flatten_nested_list(
+            [item.audio_features for item in items if item.audio_features]
+        )
+        # list, [[x1, x2], [y1], [z1]]
+        audio_feature_lens_raw = flatten_nested_list(
+            [item.audio_feature_lens for item in items if item.audio_feature_lens]
+        )
+
+        final_audio_embeds = []
+
+        assert isinstance(wavforms, list)
+        assert isinstance(wavforms[0], torch.Tensor)
+        # exist audio
+        for wavform in wavforms:
+            if len(wavform) > 0:
+                audio_feature_lens = torch.hstack(audio_feature_lens_raw)
+                batch_size, _, max_mel_seq_len = wavform.shape
+                max_seq_len = (max_mel_seq_len - 1) // 2 + 1
+
+                # Create a sequence tensor of shape (batch_size, max_seq_len)
+                seq_range = (
+                    torch.arange(
+                        0,
+                        max_seq_len,
+                        dtype=audio_feature_lens.dtype,
+                        device=audio_feature_lens.device,
+                    )
+                    .unsqueeze(0)
+                    .expand(batch_size, max_seq_len)
+                )
+                lengths_expand = audio_feature_lens.unsqueeze(1).expand(
+                    batch_size, max_seq_len
+                )
+                # Create mask
+                padding_mask = seq_range >= lengths_expand  # 1 for padded values
+
+                audio_attention_mask_ = padding_mask.view(
+                    batch_size, 1, 1, max_seq_len
+                ).expand(batch_size, 1, max_seq_len, max_seq_len)
+                audio_attention_mask = audio_attention_mask_.to(
+                    dtype=self.apm.conv1.weight.dtype,
+                    device=self.apm.conv1.weight.device,
+                )
+
+                if chunk_length > 0:
+                    chunk_num_frame = int(chunk_length * 50)
+                    chunk_mask = self.subsequent_chunk_mask(
+                        size=max_seq_len,
+                        chunk_size=chunk_num_frame,
+                        num_left_chunks=-1,
+                        device=audio_attention_mask_.device,
+                    )
+                    audio_attention_mask_ = torch.logical_or(
+                        audio_attention_mask_, torch.logical_not(chunk_mask)
+                    )
+
+                audio_attention_mask[audio_attention_mask_] = float("-inf")
+                audio_states = self.apm(
+                    wavform,
+                    output_hidden_states=True,
+                    attention_mask=audio_attention_mask,
+                ).hidden_states[self.audio_encoder_layer]
+                audio_embeds = self.audio_projection_layer(audio_states)
+
+                audio_embeds = audio_embeds.transpose(1, 2)
+                audio_embeds = self.audio_avg_pooler(audio_embeds)
+                audio_embeds = audio_embeds.transpose(1, 2)
+
+                _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(
+                    audio_feature_lens
+                )
+
+                num_audio_tokens = feature_lens_after_pooling
+
+                idx = 0
+                for i in range(len(audio_feature_lens_raw)):
+                    target_audio_embeds = []
+                    for _ in range(len(audio_feature_lens_raw[i])):
+                        target_audio_embeds.append(
+                            audio_embeds[idx, : num_audio_tokens[idx], :]
+                        )
+                        idx += 1
+                    final_audio_embeds.append(target_audio_embeds)
+            return final_audio_embeds
+
+    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        embedding = self.get_omni_embedding(
+            items=items,
+            chunk_length=self.config.audio_chunk_length,
+            stream_input=False,
+        )
+        return embedding
+
+    def get_omni_embedding(
+        self,
+        items: List[MultimodalDataItem],
+        chunk_length=-1,
+        stream_input=False,
+    ):
+        """
+        Args:
+            chunk_length: whisper use full attention or chunk attention
+            stream_input: use streaming audio embedding
+        Returns:
+            final embeddings with audio feature
+        """
+
+        if stream_input:
+            audio_embeddings = self.get_audio_embedding_streaming(items)
+        else:
+            audio_embeddings = self.get_audio_embedding(items, chunk_length)
+        bs = len(audio_embeddings)
+        # batch size
+        audio_embs = torch.cat(flatten_nested_list(audio_embeddings), dim=0)
+
+        return audio_embs
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # list of tensors
+        pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        tgt_sizes = torch.stack(
+            flatten_nested_list([item.tgt_size for item in items]), dim=0
+        )
+        assert len(pixel_values) == tgt_sizes.shape[0]
+
+        device = self.vpm.embeddings.position_embedding.weight.device
+        dtype = self.vpm.embeddings.position_embedding.weight.dtype
+        all_pixel_values_lst = [
+            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
+        ]
+
+        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
+        assert isinstance(max_patches, int)
+        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
+            all_pixel_values_lst, batch_first=True, padding_value=0.0
+        )
+
+        B, L, _ = all_pixel_values.shape
+        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+        patch_attn_mask = torch.zeros(
+            (B, 1, max_patches), dtype=torch.bool, device=device
+        )
+
+        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
+        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
+        patch_attn_mask[:, 0, :] = torch.arange(
+            patch_attn_mask.size(2), device=patch_attn_mask.device
+        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
+
+        vision_embedding = self.vpm(
+            all_pixel_values.type(dtype),
+            patch_attention_mask=patch_attn_mask,
+            tgt_sizes=tgt_sizes,
+        )
+        return self.resampler(vision_embedding, tgt_sizes)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=self.llm,
+            multimodal_model=self,
+            positions=positions,
+        )
+        return hidden_states
+
+_SUPPORT_VERSION = {(2, 6): MiniCPMO2_6, (4, 0): MiniCPMO4_0}
+
+# _SUPPORT_VERSION = {(2, 6): MiniCPMO2_6}
+
+class MiniCPMO:
+
+    minicpmo: nn.Module
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__()
+
+        if not hasattr(config, "version"):
+            version = (2, 6)
+        else:
+            version = str(config.version).split(".")
+            version = tuple([int(x) for x in version])
+
+        instance_class = _SUPPORT_VERSION.get(version, None)
+        print(version)
+
+        if instance_class is None:
+            raise ValueError(
+                f"MiniCPMO version {version} is not supported. "
+                f"Supported versions are: {list(_SUPPORT_VERSION.keys())}"
+            )
+        try:
+            minicpmo = instance_class(
+                config=config, quant_config=quant_config
+            )
+            self.minicpmo = minicpmo
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to initialize MiniCPMO with version {version}. "
+                f"Error: {str(e)}"
+            )
+        self.config = config
+
+    def __getattr__(self, name):
+        if name == "minicpmo":
+            return None
+        return getattr(self.minicpmo, name)
+
+    def __call__(self, *args, **kwargs):
+        return self.minicpmo(*args, **kwargs)
+    
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1912,4 +3095,4 @@ class MiniCPMO(MiniCPMBaseModel):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = [MiniCPMO]
+EntryClass = MiniCPMO
